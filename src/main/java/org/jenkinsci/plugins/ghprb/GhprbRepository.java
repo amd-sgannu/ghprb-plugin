@@ -138,14 +138,15 @@ public class GhprbRepository implements Saveable {
             return;
         }
 
-        GHRepository repo = getGitHubRepo();
-
         List<GHPullRequest> openPulls;
         try {
-            openPulls = repo.getPullRequests(GHIssueState.OPEN);
+            openPulls = getGitHubRepo().getPullRequests(GHIssueState.OPEN);
         } catch (IOException ex) {
-            LOGGER.log(Level.SEVERE, "Could not retrieve open pull requests.", ex);
-            return;
+            LOGGER.log(Level.WARNING, "Could not retrieve open pull requests, attempting connection refresh", ex);
+            openPulls = retryGetPullRequests();
+            if (openPulls == null) {
+                return;
+            }
         }
 
 
@@ -173,6 +174,25 @@ public class GhprbRepository implements Saveable {
             this.save();
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Unable to save repository!", e);
+        }
+    }
+
+    private List<GHPullRequest> retryGetPullRequests() {
+        ghRepository = null;
+        try {
+            trigger.getGitHubApiAuth().invalidateConnection();
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Failed to invalidate GitHub connection", e);
+            return null;
+        }
+        if (!initGhRepository()) {
+            return null;
+        }
+        try {
+            return getGitHubRepo().getPullRequests(GHIssueState.OPEN);
+        } catch (IOException retryEx) {
+            LOGGER.log(Level.SEVERE, "Could not retrieve open pull requests after connection refresh", retryEx);
+            return null;
         }
     }
 

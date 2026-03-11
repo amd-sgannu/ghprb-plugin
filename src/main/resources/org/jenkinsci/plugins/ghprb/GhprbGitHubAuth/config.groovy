@@ -23,10 +23,18 @@ f.entry(title: _("Credentials"), field: "credentialsId") {
     }""" /* workaround for JENKINS-19124 */)
 }
 
+f.entry(title: _("GitHub App ID"), field: "appId") {
+    f.textbox()
+}
+
+f.entry(title: _("GitHub App Installation ID"), field: "installationId") {
+    f.textbox()
+}
+
 f.advanced(title: _("Test Credentials")) {
     f.optionalBlock(title: _("Test basic connection to GitHub")) {
         f.entry() {
-            f.validateButton(title: _("Connect to API"), progress: _("Connecting..."), with: "serverAPIUrl,credentialsId", method: "testGithubAccess")
+            f.validateButton(title: _("Connect to API"), progress: _("Connecting..."), with: "serverAPIUrl,credentialsId,appId,installationId", method: "testGithubAccess")
         }
     }
 
@@ -35,7 +43,7 @@ f.advanced(title: _("Test Credentials")) {
     }
     f.optionalBlock(title: _("Test Permissions to a Repository")) {
         f.entry() {
-            f.validateButton(title: _("Check repo permissions"), progress: _("Checking..."), with: "serverAPIUrl,credentialsId,repo", method: "checkRepoAccess")
+            f.validateButton(title: _("Check repo permissions"), progress: _("Checking..."), with: "serverAPIUrl,credentialsId,repo,appId,installationId", method: "checkRepoAccess")
         }
     }
     f.optionalBlock(title: _("Test adding comment to Pull Request")) {
@@ -45,7 +53,7 @@ f.advanced(title: _("Test Credentials")) {
         f.entry(title: _("Comment to post"), field: "message1") {
             f.textbox()
         }
-        f.validateButton(title: _("Comment to issue"), progress: _("Commenting..."), with: "serverAPIUrl,credentialsId,repo,issueId,message1", method: "testComment")
+        f.validateButton(title: _("Comment to issue"), progress: _("Commenting..."), with: "serverAPIUrl,credentialsId,repo,issueId,message1,appId,installationId", method: "testComment")
     }
     f.optionalBlock(title: _("Test updating commit status")) {
         f.entry(title: _("Commit SHA"), field: "sha1") {
@@ -63,7 +71,7 @@ f.advanced(title: _("Test Credentials")) {
         f.entry(title: _("Context for the status"), field: "context") {
             f.textbox()
         }
-        f.validateButton(title: _("Update status"), progress: _("Updating..."), with: "serverAPIUrl,credentialsId,repo,sha1,state,url,message2,context", method: "testUpdateStatus")
+        f.validateButton(title: _("Update status"), progress: _("Updating..."), with: "serverAPIUrl,credentialsId,repo,sha1,state,url,message2,context,appId,installationId", method: "testUpdateStatus")
     }
 }
 

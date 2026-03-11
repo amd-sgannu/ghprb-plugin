@@ -11,7 +11,7 @@
 
     <artifactId>ghprb</artifactId>
     <name>GitHub Pull Request Builder</name>
-    <version>1.42.3-SNAPSHOT</version>
+    <version>testing-SNAPSHOT</version>
     <packaging>hpi</packaging>
 
     <url>https://github.com/jenkinsci/ghprb-plugin</url>
@@ -53,7 +53,7 @@
         <workflow.version>1.4</workflow.version>
         <jenkins.version>2.7</jenkins.version>
         <powermock.version>1.6.2</powermock.version>
-        <java.level>7</java.level>
+        <java.level>8</java.level>
         <findbugs.failOnError>false</findbugs.failOnError>
         <checkstyle.version>6.7</checkstyle.version>
         <checkstyle.plugin.version>2.17</checkstyle.plugin.version>
@@ -88,7 +88,7 @@
         <dependency>
             <groupId>org.jenkins-ci</groupId>
             <artifactId>annotation-indexer</artifactId>
-            <version>1.12</version>
+            <version>1.16</version>
         </dependency>
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
@@ -259,10 +259,22 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.5.1</version>
+                <version>3.11.0</version>
                 <configuration>
-                    <source>1.7</source>
-                    <target>1.7</target>
+                    <source>1.8</source>
+                    <target>1.8</target>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>net.java.sezpoz</groupId>
+                            <artifactId>sezpoz</artifactId>
+                            <version>1.13</version>
+                        </path>
+                        <path>
+                            <groupId>org.jenkins-ci</groupId>
+                            <artifactId>annotation-indexer</artifactId>
+                            <version>1.16</version>
+                        </path>
+                    </annotationProcessorPaths>
                 </configuration>
             </plugin>
             <plugin>

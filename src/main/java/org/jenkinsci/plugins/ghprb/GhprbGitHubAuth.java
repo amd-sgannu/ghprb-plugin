@@ -72,7 +72,15 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
 
     private final Secret secret;
 
+    private final String appId;
+
+    private final String installationId;
+
     private transient GitHub gh;
+
+    private transient GitHubAppTokenProvider tokenProvider;
+
+    private transient String lastAppToken;
 
     @DataBoundConstructor
     public GhprbGitHubAuth(
@@ -81,7 +89,9 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
             String credentialsId,
             String description,
             String id,
-            Secret secret
+            Secret secret,
+            String appId,
+            String installationId
     ) {
         if (StringUtils.isEmpty(serverAPIUrl)) {
             serverAPIUrl = "https://api.github.com";
@@ -96,6 +106,8 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
         this.id = IdCredentials.Helpers.fixEmptyId(id);
         this.description = description;
         this.secret = secret;
+        this.appId = fixEmptyAndTrim(appId);
+        this.installationId = fixEmptyAndTrim(installationId);
     }
 
     @Exported
@@ -129,6 +141,41 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
         return secret;
     }
 
+    @Exported
+    public String getAppId() {
+        return appId;
+    }
+
+    @Exported
+    public String getInstallationId() {
+        return installationId;
+    }
+
+    private boolean isGitHubAppMode() {
+        return !StringUtils.isEmpty(appId) && !StringUtils.isEmpty(installationId);
+    }
+
+    private GitHubAppTokenProvider getOrCreateTokenProvider(Item context) throws IOException {
+        if (tokenProvider == null) {
+            StandardCredentials credentials = Ghprb.lookupCredentials(context, credentialsId, serverAPIUrl);
+            if (credentials == null) {
+                throw new IOException("GitHub App credentials not found for id: " + credentialsId);
+            }
+            if (!(credentials instanceof StringCredentials)) {
+                throw new IOException(
+                        "GitHub App requires Secret text credential with PEM private key, got: "
+                                + credentials.getClass().getName()
+                );
+            }
+            String pem = ((StringCredentials) credentials).getSecret().getPlainText();
+            try {
+                tokenProvider = new GitHubAppTokenProvider(appId, installationId, pem, serverAPIUrl);
+            } catch (java.security.GeneralSecurityException e) {
+                throw new IOException("Failed to initialize GitHub App token provider", e);
+            }
+        }
+        return tokenProvider;
+    }
 
     public boolean checkSignature(String body, String signature) {
         if (secret == null || StringUtils.isEmpty(secret.getPlainText())) {
@@ -170,10 +217,44 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
     }
 
     private static GitHubBuilder getBuilder(Item context, String serverAPIUrl, String credentialsId) {
+        return getBuilder(context, serverAPIUrl, credentialsId, null, null);
+    }
+
+    private static GitHubBuilder getBuilder(
+            Item context, String serverAPIUrl, String credentialsId,
+            String ghAppId, String ghInstallationId
+    ) {
         GitHubBuilder builder = new GitHubBuilder()
                 .withEndpoint(serverAPIUrl)
                 .withConnector(new HttpConnectorWithJenkinsProxy());
         String contextName = context == null ? "(Jenkins.instance)" : context.getFullDisplayName();
+
+        if (!StringUtils.isEmpty(ghAppId) && !StringUtils.isEmpty(ghInstallationId)) {
+            LOGGER.log(Level.FINEST, "Using GitHub App auth for context {0} (App ID: {1})",
+                    new Object[] {contextName, ghAppId});
+            StandardCredentials credentials = Ghprb.lookupCredentials(context, credentialsId, serverAPIUrl);
+            if (credentials == null) {
+                LOGGER.log(Level.SEVERE, "Failed to look up PEM credentials for GitHub App using id: {0}",
+                        credentialsId);
+                return null;
+            }
+            if (!(credentials instanceof StringCredentials)) {
+                LOGGER.log(Level.SEVERE,
+                        "GitHub App requires Secret text credential with PEM private key, got: {0}",
+                        credentials.getClass().getName());
+                return null;
+            }
+            try {
+                String pem = ((StringCredentials) credentials).getSecret().getPlainText();
+                GitHubAppTokenProvider provider = new GitHubAppTokenProvider(
+                        ghAppId, ghInstallationId, pem, serverAPIUrl);
+                builder.withOAuthToken(provider.getToken());
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE, "Failed to obtain GitHub App installation token for " + contextName, e);
+                return null;
+            }
+            return builder;
+        }
 
         if (StringUtils.isEmpty(credentialsId)) {
             LOGGER.log(Level.WARNING, "credentialsId not set for context {0}, using anonymous connection", contextName);
@@ -215,11 +296,38 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
 
     public GitHub getConnection(Item context) throws IOException {
         synchronized (this) {
-            if (gh == null) {
-                buildConnection(context);
+            if (isGitHubAppMode()) {
+                GitHubAppTokenProvider provider = getOrCreateTokenProvider(context);
+                String token = provider.getToken();
+                if (gh == null || !token.equals(lastAppToken)) {
+                    LOGGER.log(Level.FINE, "Building new GitHub connection with fresh App installation token");
+                    gh = new GitHubBuilder()
+                            .withEndpoint(serverAPIUrl)
+                            .withConnector(new HttpConnectorWithJenkinsProxy())
+                            .withOAuthToken(token)
+                            .build();
+                    lastAppToken = token;
+                }
+            } else {
+                if (gh == null) {
+                    buildConnection(context);
+                }
             }
-
             return gh;
+        }
+    }
+
+    /**
+     * Invalidates the cached GitHub connection and any cached tokens,
+     * forcing a full re-authentication on the next {@link #getConnection} call.
+     */
+    public void invalidateConnection() {
+        synchronized (this) {
+            gh = null;
+            lastAppToken = null;
+            if (tokenProvider != null) {
+                tokenProvider.invalidate();
+            }
         }
     }
 
@@ -332,12 +440,14 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
         public FormValidation doCheckRepoAccess(
                 @QueryParameter("serverAPIUrl") final String serverAPIUrl,
                 @QueryParameter("credentialsId") final String credentialsId,
-                @QueryParameter("repo") final String repo) {
+                @QueryParameter("repo") final String repo,
+                @QueryParameter("appId") final String appId,
+                @QueryParameter("installationId") final String installationId) {
 
             Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
 
             try {
-                GitHubBuilder builder = getBuilder(null, serverAPIUrl, credentialsId);
+                GitHubBuilder builder = getBuilder(null, serverAPIUrl, credentialsId, appId, installationId);
                 if (builder == null) {
                     return FormValidation.error("Unable to look up GitHub credentials using ID: " + credentialsId + "!!");
                 }
@@ -366,16 +476,27 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
         @POST
         public FormValidation doTestGithubAccess(
                 @QueryParameter("serverAPIUrl") final String serverAPIUrl,
-                @QueryParameter("credentialsId") final String credentialsId) {
+                @QueryParameter("credentialsId") final String credentialsId,
+                @QueryParameter("appId") final String appId,
+                @QueryParameter("installationId") final String installationId) {
 
             Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
 
             try {
-                GitHubBuilder builder = getBuilder(null, serverAPIUrl, credentialsId);
+                GitHubBuilder builder = getBuilder(null, serverAPIUrl, credentialsId, appId, installationId);
                 if (builder == null) {
                     return FormValidation.error("Unable to look up GitHub credentials using ID: " + credentialsId + "!!");
                 }
                 GitHub gh = builder.build();
+
+                if (!StringUtils.isEmpty(appId) && !StringUtils.isEmpty(installationId)) {
+                    gh.getRateLimit();
+                    String comment = String.format(
+                            "Connected to %s using GitHub App (App ID: %s, Installation: %s)",
+                            serverAPIUrl, appId, installationId);
+                    return FormValidation.ok(comment);
+                }
+
                 GHMyself me = gh.getMyself();
                 String name = me.getName();
                 String email = me.getEmail();
@@ -394,9 +515,11 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
                 @QueryParameter("credentialsId") final String credentialsId,
                 @QueryParameter("repo") final String repoName,
                 @QueryParameter("issueId") final int issueId,
-                @QueryParameter("message1") final String comment) {
+                @QueryParameter("message1") final String comment,
+                @QueryParameter("appId") final String appId,
+                @QueryParameter("installationId") final String installationId) {
             try {
-                GitHubBuilder builder = getBuilder(null, serverAPIUrl, credentialsId);
+                GitHubBuilder builder = getBuilder(null, serverAPIUrl, credentialsId, appId, installationId);
                 if (builder == null) {
                     return FormValidation.error("Unable to look up GitHub credentials using ID: " + credentialsId + "!!");
                 }
@@ -419,9 +542,11 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
                 @QueryParameter("state") final GHCommitState state,
                 @QueryParameter("url") final String url,
                 @QueryParameter("message2") final String message,
-                @QueryParameter("context") final String context) {
+                @QueryParameter("context") final String context,
+                @QueryParameter("appId") final String appId,
+                @QueryParameter("installationId") final String installationId) {
             try {
-                GitHubBuilder builder = getBuilder(null, serverAPIUrl, credentialsId);
+                GitHubBuilder builder = getBuilder(null, serverAPIUrl, credentialsId, appId, installationId);
                 if (builder == null) {
                     return FormValidation.error("Unable to look up GitHub credentials using ID: " + credentialsId + "!!");
                 }

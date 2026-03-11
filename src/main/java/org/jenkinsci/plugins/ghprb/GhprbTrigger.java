@@ -822,7 +822,7 @@ public class GhprbTrigger extends GhprbTriggerBackwardsCompatible {
         public List<GhprbGitHubAuth> getGithubAuth() {
             if (githubAuth == null || githubAuth.size() == 0) {
                 githubAuth = new ArrayList<GhprbGitHubAuth>(1);
-                githubAuth.add(new GhprbGitHubAuth(null, null, null, "Anonymous connection", null, null));
+                githubAuth.add(new GhprbGitHubAuth(null, null, null, "Anonymous connection", null, null, null, null));
             }
             return githubAuth;
         }
@@ -1253,6 +1253,8 @@ public class GhprbTrigger extends GhprbTriggerBackwardsCompatible {
                             Ghprb.createCredentials(serverAPIUrl, accessToken),
                             "Pre credentials Token",
                             null,
+                            null,
+                            null,
                             null
                     );
                     if (githubAuth == null) {
@@ -1273,6 +1275,8 @@ public class GhprbTrigger extends GhprbTriggerBackwardsCompatible {
                             null,
                             Ghprb.createCredentials(serverAPIUrl, username, password),
                             "Pre credentials username and password",
+                            null,
+                            null,
                             null,
                             null
                     );
