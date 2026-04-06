@@ -2,8 +2,6 @@ package org.jenkinsci.plugins.ghprb;
 
 import hudson.ProxyConfiguration;
 import net.sf.json.JSONObject;
-import org.apache.commons.codec.binary.Base64;
-
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -37,11 +35,15 @@ public final class GitHubAppTokenProvider {
 
     private static final long TOKEN_REFRESH_BUFFER_MS = 300000L;
 
+    private static final long MILLIS_PER_MINUTE = 60000L;
+
     private static final int HTTP_CREATED = 201;
 
     private static final int CONNECT_TIMEOUT = 10000;
 
     private static final int READ_TIMEOUT = 10000;
+
+    private static final int PEM_HEADER_LOG_LENGTH = 35;
 
     private static final String PKCS1_HEADER = "-----BEGIN RSA PRIVATE KEY-----";
 
@@ -93,7 +95,25 @@ public final class GitHubAppTokenProvider {
         this.appId = appId;
         this.installationId = installationId;
         this.serverAPIUrl = normalizeUrl(serverAPIUrl);
-        this.privateKey = parsePrivateKey(privateKeyPem);
+
+        String cleanedPem = privateKeyPem.replace("\r\n", "\n").replace("\r", "\n").trim();
+        if (cleanedPem.startsWith("\uFEFF")) {
+            cleanedPem = cleanedPem.substring(1);
+        }
+
+        LOGGER.log(Level.WARNING,
+                "[GHPRB-GitHubApp] Initializing token provider: App ID={0}, "
+                        + "Installation={1}, PEM length={2} chars, "
+                        + "starts with: [{3}]",
+                new Object[] {appId, installationId, cleanedPem.length(),
+                        cleanedPem.substring(0, Math.min(cleanedPem.length(), PEM_HEADER_LOG_LENGTH))});
+
+        this.privateKey = parsePrivateKey(cleanedPem);
+        LOGGER.log(Level.WARNING,
+                "[GHPRB-GitHubApp] Private key parsed successfully, "
+                        + "algorithm={0}, format={1}",
+                new Object[] {this.privateKey.getAlgorithm(),
+                        this.privateKey.getFormat()});
     }
 
     /**
@@ -101,8 +121,26 @@ public final class GitHubAppTokenProvider {
      * Thread-safe: callers may invoke this concurrently.
      */
     public synchronized String getToken() throws IOException {
-        if (cachedToken != null && System.currentTimeMillis() < tokenExpiresAt - TOKEN_REFRESH_BUFFER_MS) {
+        long now = System.currentTimeMillis();
+        if (cachedToken != null && now < tokenExpiresAt - TOKEN_REFRESH_BUFFER_MS) {
+            long remainingMin = (tokenExpiresAt - now) / MILLIS_PER_MINUTE;
+            LOGGER.log(Level.INFO,
+                    "[GHPRB-GitHubApp] Using cached token for App ID {0}, "
+                            + "Installation {1} (expires in {2} min)",
+                    new Object[] {appId, installationId, remainingMin});
             return cachedToken;
+        }
+        if (cachedToken == null) {
+            LOGGER.log(Level.INFO,
+                    "[GHPRB-GitHubApp] No cached token, requesting new token "
+                            + "for App ID {0}, Installation {1}",
+                    new Object[] {appId, installationId});
+        } else {
+            long expiredAgoOrIn = (tokenExpiresAt - TOKEN_REFRESH_BUFFER_MS - now) / MILLIS_PER_MINUTE;
+            LOGGER.log(Level.INFO,
+                    "[GHPRB-GitHubApp] Token expiring soon (buffer reached {0} min ago), "
+                            + "refreshing for App ID {1}, Installation {2}",
+                    new Object[] {Math.abs(expiredAgoOrIn), appId, installationId});
         }
         refreshToken();
         return cachedToken;
@@ -112,15 +150,34 @@ public final class GitHubAppTokenProvider {
      * Clears the cached token, forcing a fresh exchange on the next {@link #getToken()} call.
      */
     public synchronized void invalidate() {
+        LOGGER.log(Level.INFO,
+                "[GHPRB-GitHubApp] Token INVALIDATED for App ID {0}, Installation {1}. "
+                        + "Next getToken() call will request a fresh token.",
+                new Object[] {appId, installationId});
         cachedToken = null;
         tokenExpiresAt = 0;
     }
 
     private void refreshToken() throws IOException {
+        long startTime = System.currentTimeMillis();
+        LOGGER.log(Level.WARNING,
+                "[GHPRB-GitHubApp] === Token refresh starting for App ID={0}, Installation={1} ===",
+                new Object[] {appId, installationId});
         String jwt = generateJwt();
-        String url = serverAPIUrl + "/app/installations/" + installationId + "/access_tokens";
 
-        LOGGER.log(Level.FINE, "Requesting new GitHub App installation token from {0}", url);
+        int firstDot = jwt.indexOf('.');
+        int lastDot = jwt.lastIndexOf('.');
+        LOGGER.log(Level.WARNING,
+                "[GHPRB-GitHubApp] JWT debug: total length={0}, "
+                        + "dots at positions [{1}, {2}], "
+                        + "header(decoded)={3}, payload(decoded)={4}",
+                new Object[] {jwt.length(), firstDot, lastDot,
+                        decodeBase64Url(jwt.substring(0, firstDot)),
+                        decodeBase64Url(jwt.substring(firstDot + 1, lastDot))});
+
+        String url = serverAPIUrl + "/app/installations/" + installationId + "/access_tokens";
+        LOGGER.log(Level.WARNING,
+                "[GHPRB-GitHubApp] Requesting new installation token from {0}", url);
 
         HttpURLConnection conn = (HttpURLConnection) ProxyConfiguration.open(new URL(url));
         try {
@@ -137,6 +194,9 @@ public final class GitHubAppTokenProvider {
             int responseCode = conn.getResponseCode();
             if (responseCode != HTTP_CREATED) {
                 String error = readStream(conn.getErrorStream());
+                LOGGER.log(Level.SEVERE,
+                        "[GHPRB-GitHubApp] Token request FAILED (HTTP {0}): {1}",
+                        new Object[] {responseCode, error});
                 throw new IOException(
                         "GitHub App token request failed (HTTP " + responseCode + "): " + error
                 );
@@ -148,7 +208,12 @@ public final class GitHubAppTokenProvider {
             String expiresAt = json.getString("expires_at");
             tokenExpiresAt = parseIso8601(expiresAt);
 
-            LOGGER.log(Level.INFO, "Obtained GitHub App installation token (expires at {0})", expiresAt);
+            long elapsed = System.currentTimeMillis() - startTime;
+            LOGGER.log(Level.INFO,
+                    "[GHPRB-GitHubApp] Token REFRESHED successfully in {0}ms "
+                            + "for App ID {1}, Installation {2}. "
+                            + "New token expires at {3}",
+                    new Object[] {elapsed, appId, installationId, expiresAt});
         } finally {
             conn.disconnect();
         }
@@ -163,6 +228,9 @@ public final class GitHubAppTokenProvider {
             String payload = "{\"iss\":\""
                     + appId + "\",\"iat\":" + nowSeconds + ",\"exp\":" + expSeconds + "}";
 
+            LOGGER.log(Level.INFO,
+                    "[GHPRB-GitHubApp] JWT payload: {0}", payload);
+
             String encodedHeader = base64UrlEncode(header.getBytes("UTF-8"));
             String encodedPayload = base64UrlEncode(payload.getBytes("UTF-8"));
             String signingInput = encodedHeader + "." + encodedPayload;
@@ -172,7 +240,14 @@ public final class GitHubAppTokenProvider {
             sig.update(signingInput.getBytes("UTF-8"));
             byte[] signatureBytes = sig.sign();
 
-            return signingInput + "." + base64UrlEncode(signatureBytes);
+            String jwt = signingInput + "." + base64UrlEncode(signatureBytes);
+            LOGGER.log(Level.INFO,
+                    "[GHPRB-GitHubApp] JWT generated, total length={0}, "
+                            + "parts: header={1} payload={2} signature={3} chars",
+                    new Object[] {jwt.length(), encodedHeader.length(),
+                            encodedPayload.length(),
+                            base64UrlEncode(signatureBytes).length()});
+            return jwt;
         } catch (Exception e) {
             throw new RuntimeException("Failed to generate JWT for GitHub App", e);
         }
@@ -188,7 +263,7 @@ public final class GitHubAppTokenProvider {
                 .replace(PKCS8_FOOTER, "")
                 .replaceAll("\\s+", "");
 
-        byte[] decoded = Base64.decodeBase64(base64Content);
+        byte[] decoded = java.util.Base64.getMimeDecoder().decode(base64Content);
 
         if (isPkcs1) {
             decoded = convertPkcs1ToPkcs8(decoded);
@@ -246,7 +321,16 @@ public final class GitHubAppTokenProvider {
     }
 
     private static String base64UrlEncode(byte[] data) {
-        return Base64.encodeBase64URLSafeString(data);
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(data);
+    }
+
+    private static String decodeBase64Url(String encoded) {
+        try {
+            byte[] decoded = java.util.Base64.getUrlDecoder().decode(encoded);
+            return new String(decoded, "UTF-8");
+        } catch (Exception e) {
+            return "(decode failed: " + e.getMessage() + ")";
+        }
     }
 
     private static String normalizeUrl(String url) {

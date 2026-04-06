@@ -82,10 +82,6 @@ public class GhprbRepository implements Saveable {
     }
 
     private boolean initGhRepository() {
-        if (ghRepository != null) {
-            return true;
-        }
-
         GitHub gitHub = null;
 
         try {
@@ -112,7 +108,6 @@ public class GhprbRepository implements Saveable {
             LOGGER.log(Level.SEVERE, "Error while accessing rate limit API", ex);
             return false;
         }
-
 
         try {
             ghRepository = gitHub.getRepository(reponame);

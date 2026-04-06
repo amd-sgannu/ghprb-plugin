@@ -21,6 +21,7 @@ import hudson.util.Secret;
 import jenkins.model.Jenkins;
 import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.lang.StringUtils;
+import org.jenkinsci.plugins.plaincredentials.FileCredentials;
 import org.jenkinsci.plugins.plaincredentials.StringCredentials;
 import org.kohsuke.github.GHAuthorization;
 import org.kohsuke.github.GHCommitState;
@@ -37,7 +38,9 @@ import org.kohsuke.stapler.verb.POST;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -151,23 +154,21 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
         return installationId;
     }
 
+    private static final String GITHUB_APP_CREDENTIALS_CLASS =
+            "org.jenkinsci.plugins.github_branch_source.GitHubAppCredentials";
+
     private boolean isGitHubAppMode() {
         return !StringUtils.isEmpty(appId) && !StringUtils.isEmpty(installationId);
     }
 
+    private boolean isGitHubAppCredential(StandardCredentials credentials) {
+        return credentials != null
+                && GITHUB_APP_CREDENTIALS_CLASS.equals(credentials.getClass().getName());
+    }
+
     private GitHubAppTokenProvider getOrCreateTokenProvider(Item context) throws IOException {
         if (tokenProvider == null) {
-            StandardCredentials credentials = Ghprb.lookupCredentials(context, credentialsId, serverAPIUrl);
-            if (credentials == null) {
-                throw new IOException("GitHub App credentials not found for id: " + credentialsId);
-            }
-            if (!(credentials instanceof StringCredentials)) {
-                throw new IOException(
-                        "GitHub App requires Secret text credential with PEM private key, got: "
-                                + credentials.getClass().getName()
-                );
-            }
-            String pem = ((StringCredentials) credentials).getSecret().getPlainText();
+            String pem = extractPemFromCredentials(context);
             try {
                 tokenProvider = new GitHubAppTokenProvider(appId, installationId, pem, serverAPIUrl);
             } catch (java.security.GeneralSecurityException e) {
@@ -175,6 +176,58 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
             }
         }
         return tokenProvider;
+    }
+
+    private String extractPemFromCredentials(Item context) throws IOException {
+        StandardCredentials credentials = Ghprb.lookupCredentials(context, credentialsId, serverAPIUrl);
+        if (credentials == null) {
+            throw new IOException("GitHub App credentials not found for id: " + credentialsId);
+        }
+        if (credentials instanceof StringCredentials) {
+            return ((StringCredentials) credentials).getSecret().getPlainText();
+        }
+        if (credentials instanceof FileCredentials) {
+            return readFileCredential((FileCredentials) credentials);
+        }
+        throw new IOException(
+                "GitHub App requires Secret text or Secret file credential with PEM private key, got: "
+                        + credentials.getClass().getName()
+        );
+    }
+
+    private static String readFileCredential(FileCredentials fileCred) throws IOException {
+        BufferedReader reader = new BufferedReader(
+                new InputStreamReader(fileCred.getContent(), "UTF-8"));
+        try {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (sb.length() > 0) {
+                    sb.append('\n');
+                }
+                sb.append(line);
+            }
+            return sb.toString();
+        } finally {
+            reader.close();
+        }
+    }
+
+    /**
+     * Gets a fresh installation token from a GitHubAppCredentials credential.
+     * GitHubAppCredentials implements StandardUsernamePasswordCredentials;
+     * its getPassword() returns a fresh installation access token.
+     */
+    private String getGitHubAppCredentialToken(Item context) throws IOException {
+        StandardCredentials credentials = Ghprb.lookupCredentials(context, credentialsId, serverAPIUrl);
+        if (credentials == null) {
+            throw new IOException("GitHub App credentials not found for id: " + credentialsId);
+        }
+        if (credentials instanceof StandardUsernamePasswordCredentials) {
+            return ((StandardUsernamePasswordCredentials) credentials).getPassword().getPlainText();
+        }
+        throw new IOException("Credential does not provide a password/token: "
+                + credentials.getClass().getName());
     }
 
     public boolean checkSignature(String body, String signature) {
@@ -229,56 +282,80 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
                 .withConnector(new HttpConnectorWithJenkinsProxy());
         String contextName = context == null ? "(Jenkins.instance)" : context.getFullDisplayName();
 
+        StandardCredentials credentials = StringUtils.isEmpty(credentialsId)
+                ? null : Ghprb.lookupCredentials(context, credentialsId, serverAPIUrl);
+
+        if (credentials != null
+                && GITHUB_APP_CREDENTIALS_CLASS.equals(credentials.getClass().getName())) {
+            LOGGER.log(Level.FINEST, "Using GitHubAppCredentials for context {0}", contextName);
+            String token = ((StandardUsernamePasswordCredentials) credentials)
+                    .getPassword().getPlainText();
+            builder.withOAuthToken(token);
+            return builder;
+        }
+
         if (!StringUtils.isEmpty(ghAppId) && !StringUtils.isEmpty(ghInstallationId)) {
             LOGGER.log(Level.FINEST, "Using GitHub App auth for context {0} (App ID: {1})",
                     new Object[] {contextName, ghAppId});
-            StandardCredentials credentials = Ghprb.lookupCredentials(context, credentialsId, serverAPIUrl);
             if (credentials == null) {
-                LOGGER.log(Level.SEVERE, "Failed to look up PEM credentials for GitHub App using id: {0}",
+                LOGGER.log(Level.SEVERE,
+                        "Failed to look up PEM credentials for GitHub App using id: {0}",
                         credentialsId);
                 return null;
             }
-            if (!(credentials instanceof StringCredentials)) {
-                LOGGER.log(Level.SEVERE,
-                        "GitHub App requires Secret text credential with PEM private key, got: {0}",
-                        credentials.getClass().getName());
-                return null;
-            }
             try {
-                String pem = ((StringCredentials) credentials).getSecret().getPlainText();
+                String pem = extractPemFromStatic(credentials);
                 GitHubAppTokenProvider provider = new GitHubAppTokenProvider(
                         ghAppId, ghInstallationId, pem, serverAPIUrl);
                 builder.withOAuthToken(provider.getToken());
             } catch (Exception e) {
-                LOGGER.log(Level.SEVERE, "Failed to obtain GitHub App installation token for " + contextName, e);
+                LOGGER.log(Level.SEVERE,
+                        "Failed to obtain GitHub App installation token for " + contextName, e);
                 return null;
             }
             return builder;
         }
 
         if (StringUtils.isEmpty(credentialsId)) {
-            LOGGER.log(Level.WARNING, "credentialsId not set for context {0}, using anonymous connection", contextName);
+            LOGGER.log(Level.WARNING,
+                    "credentialsId not set for context {0}, using anonymous connection",
+                    contextName);
             return builder;
         }
 
-        StandardCredentials credentials = Ghprb.lookupCredentials(context, credentialsId, serverAPIUrl);
         if (credentials == null) {
             LOGGER.log(Level.SEVERE, "Failed to look up credentials for context {0} using id: {1}",
                     new Object[] {contextName, credentialsId});
         } else if (credentials instanceof StandardUsernamePasswordCredentials) {
             LOGGER.log(Level.FINEST, "Using username/password for context {0}", contextName);
-            StandardUsernamePasswordCredentials upCredentials = (StandardUsernamePasswordCredentials) credentials;
-            builder.withPassword(upCredentials.getUsername(), upCredentials.getPassword().getPlainText());
+            StandardUsernamePasswordCredentials upCredentials =
+                    (StandardUsernamePasswordCredentials) credentials;
+            builder.withPassword(upCredentials.getUsername(),
+                    upCredentials.getPassword().getPlainText());
         } else if (credentials instanceof StringCredentials) {
             LOGGER.log(Level.FINEST, "Using OAuth token for context {0}", contextName);
             StringCredentials tokenCredentials = (StringCredentials) credentials;
             builder.withOAuthToken(tokenCredentials.getSecret().getPlainText());
         } else {
-            LOGGER.log(Level.SEVERE, "Unknown credential type for context {0} using id: {1}: {2}",
+            LOGGER.log(Level.SEVERE,
+                    "Unknown credential type for context {0} using id: {1}: {2}",
                     new Object[] {contextName, credentialsId, credentials.getClass().getName()});
             return null;
         }
         return builder;
+    }
+
+    private static String extractPemFromStatic(StandardCredentials credentials) throws IOException {
+        if (credentials instanceof StringCredentials) {
+            return ((StringCredentials) credentials).getSecret().getPlainText();
+        }
+        if (credentials instanceof FileCredentials) {
+            return readFileCredential((FileCredentials) credentials);
+        }
+        throw new IOException(
+                "GitHub App requires Secret text or Secret file credential with PEM key, got: "
+                        + credentials.getClass().getName()
+        );
     }
 
     private void buildConnection(Item context) {
@@ -296,17 +373,45 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
 
     public GitHub getConnection(Item context) throws IOException {
         synchronized (this) {
-            if (isGitHubAppMode()) {
-                GitHubAppTokenProvider provider = getOrCreateTokenProvider(context);
-                String token = provider.getToken();
+            StandardCredentials credentials = StringUtils.isEmpty(credentialsId)
+                    ? null : Ghprb.lookupCredentials(context, credentialsId, serverAPIUrl);
+
+            if (isGitHubAppCredential(credentials)) {
+                String token = getGitHubAppCredentialToken(context);
                 if (gh == null || !token.equals(lastAppToken)) {
-                    LOGGER.log(Level.FINE, "Building new GitHub connection with fresh App installation token");
+                    LOGGER.log(Level.INFO,
+                            "[GHPRB-GitHubApp] Token changed, rebuilding GitHub API connection "
+                                    + "(GitHubAppCredentials mode)");
                     gh = new GitHubBuilder()
                             .withEndpoint(serverAPIUrl)
                             .withConnector(new HttpConnectorWithJenkinsProxy())
                             .withOAuthToken(token)
                             .build();
                     lastAppToken = token;
+                } else {
+                    LOGGER.log(Level.INFO,
+                            "[GHPRB-GitHubApp] Reusing existing GitHub API connection "
+                                    + "(GitHubAppCredentials mode)");
+                }
+            } else if (isGitHubAppMode()) {
+                GitHubAppTokenProvider provider = getOrCreateTokenProvider(context);
+                String token = provider.getToken();
+                if (gh == null || !token.equals(lastAppToken)) {
+                    LOGGER.log(Level.INFO,
+                            "[GHPRB-GitHubApp] Token changed, rebuilding GitHub API connection "
+                                    + "(App ID: {0}, Installation: {1})",
+                            new Object[] {appId, installationId});
+                    gh = new GitHubBuilder()
+                            .withEndpoint(serverAPIUrl)
+                            .withConnector(new HttpConnectorWithJenkinsProxy())
+                            .withOAuthToken(token)
+                            .build();
+                    lastAppToken = token;
+                } else {
+                    LOGGER.log(Level.INFO,
+                            "[GHPRB-GitHubApp] Reusing existing GitHub API connection "
+                                    + "(App ID: {0}, Installation: {1})",
+                            new Object[] {appId, installationId});
                 }
             } else {
                 if (gh == null) {
@@ -365,6 +470,13 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
 
             matchers.add(CredentialsMatchers.instanceOf(StandardUsernamePasswordCredentials.class));
             matchers.add(CredentialsMatchers.instanceOf(StringCredentials.class));
+            matchers.add(CredentialsMatchers.instanceOf(FileCredentials.class));
+            try {
+                Class<?> appCredClass = Class.forName(GITHUB_APP_CREDENTIALS_CLASS);
+                matchers.add(CredentialsMatchers.instanceOf(appCredClass));
+            } catch (ClassNotFoundException ignored) {
+                // github-branch-source plugin not installed
+            }
 
             List<StandardCredentials> credentials = CredentialsProvider.lookupCredentials(
                     StandardCredentials.class,
@@ -489,11 +601,16 @@ public class GhprbGitHubAuth extends AbstractDescribableImpl<GhprbGitHubAuth> {
                 }
                 GitHub gh = builder.build();
 
-                if (!StringUtils.isEmpty(appId) && !StringUtils.isEmpty(installationId)) {
+                StandardCredentials cred = StringUtils.isEmpty(credentialsId)
+                        ? null : Ghprb.lookupCredentials(null, credentialsId, serverAPIUrl);
+                boolean isAppMode = (!StringUtils.isEmpty(appId) && !StringUtils.isEmpty(installationId))
+                        || (cred != null && GITHUB_APP_CREDENTIALS_CLASS.equals(cred.getClass().getName()));
+
+                if (isAppMode) {
                     gh.getRateLimit();
                     String comment = String.format(
-                            "Connected to %s using GitHub App (App ID: %s, Installation: %s)",
-                            serverAPIUrl, appId, installationId);
+                            "Connected to %s using GitHub App credentials",
+                            serverAPIUrl);
                     return FormValidation.ok(comment);
                 }
 
