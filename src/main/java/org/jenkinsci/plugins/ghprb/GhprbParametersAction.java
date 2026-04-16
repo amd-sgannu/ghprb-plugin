@@ -47,6 +47,11 @@ public class GhprbParametersAction extends ParametersAction {
         return null;
     }
 
+    @Override
+    public List<ParameterValue> getAllParameters() {
+        return Collections.unmodifiableList(parameters);
+    }
+
     @Extension
     public static final class GhprbAdditionalParameterEnvironmentContributor extends EnvironmentContributor {
 
